@@ -1,0 +1,240 @@
+---
+title: "Assignment 3_Patrick He"
+output: html_document
+---
+Step 1 Import Packages and Data
+```{r}
+rm(list = ls(all = TRUE))
+setwd("/Users/patrickhe/Desktop/MSBA/Social Network/Assignment 3")
+
+library(data.table)
+library(igraph)
+library(stringr)
+library(splitstackshape)
+library(plotly)
+library(network)
+library(lubridate)
+library(dplyr)
+library(reshape)
+library(MASS)
+library(plm)
+library(pglm)
+library(ggplot2)
+
+#load datasets
+rain = fread(file = "rain_information.csv", header = TRUE)
+dist = fread(file = "district_information.csv", header = TRUE)
+bord = fread(file = "border_information.csv", header = TRUE)
+pty = fread(file = "new_parties_in_each_district_by_candidate.csv", header = TRUE)
+  
+new_p = dist[,c(2,3,4,5,6,15,16,17,23)]
+
+```
+
+Step 2 Data Cleaning and Preparation for Question 1-4
+
+2.1 Create a list of year ranges
+First we use unique() function to find a list of election years from the district data set.Then I utilize seq() with the beginning year and ending year of the election period as inputs to get all years in the election period. 
+```{r}
+ele = unique(dist$year)
+ele = sort(append(ele, 1945))
+ele_yr = lapply(seq_along(ele)[-1], function(i) seq(ele[i -1] + 1, ele[i]))
+ele = ele[-1]
+print(ele)
+print(ele_yr)
+```
+
+2.2 Create a column for extreme weather in rain (year with spi greater than 1 or less than -1)
+```{r}
+rain[, extreme := as.numeric(spi > 1 | spi < -1)]
+```
+
+2.3 Segement the dataset by election period and calculate total rain level and average spi
+To calculate the total rain level and average spi for each district in each election period, I first segement the datasets into 14 different tables, which represent the 14 election years. Then I use the by attribute so in each table, we can calcualte the rain and spi for districts one by one. 
+
+When I examine the dataset, I also found some district only have one year's data in the multi-yaer election period, so I change all years in each election year table to the election year. 
+```{r}
+#create a list of tables based on the year range created
+#calculate the sum of rain and the mean of spi in each table by districts 
+ele_p = lapply(seq_along(ele_yr), function(i) rain[year%in%ele_yr[[i]]])
+ele_p = lapply(seq_along(ele_p), function(i) ele_p[[i]][, rain := sum(rain), by = district])
+ele_p = lapply(seq_along(ele_p), function(i) ele_p[[i]][, spi := mean(spi), by = district])
+ele_p = lapply(seq_along(ele_p), function(i) ele_p[[i]][, extreme := sum(extreme, na.rm=TRUE), by = district])
+ele_p = lapply(seq_along(ele_p), function(i) ele_p[[i]][, length := length(ele_yr[[i]]), by = district])
+#Many district only have one year data in the election, so we just use the one year data as the calculation result for rain and spi
+ele_p = lapply(seq_along(ele_p), function(i) ele_p[[i]][, year := max(ele_yr[[i]]), by = district])
+
+ele_p[[1]][1:6]
+sum(rain[1:6,rain])
+```
+Then I rbind the tables and removed the redundant rows.
+```{r}
+#create a new table including only the rows with election years
+a = rbindlist(ele_p)
+a = unique(a)
+newp = new_p[order(year),] 
+
+#Merge the table with mean value and sum value with the dist table
+#b = left_join(a,new_p,by=c("year","district")), cannot find columns of b with this method
+b = merge(a,new_p)
+```
+
+2.4 Lagged rain and spi for Neighbors
+I first create a list with unique focal districts in the border dataset. Then I segment the dataset by focal districts so I have the list of neighbor districts. With the same method we applied in 2.3, I calcualted the sum rain and average spi for the neighbor districts by election years.
+
+```{r}
+#border info
+focal = unique(bord$focal_district)
+nbr = lapply(seq_along(focal), function(i) bord[focal_district%in%focal[[i]]])
+
+d = lapply(seq_along(nbr), function(i) b[district%in%unlist(nbr[[i]][,2])])
+d_sum = lapply(seq_along(d), function(i) d[[i]][, lagg_rain := (sum(rain)/count(unique(d[[i]][,2]))), by = year])
+d_mean = lapply(seq_along(d), function(i) d[[i]][, lagg_spi := (sum(spi)/count(unique(d[[i]][,2]))), by = year])
+d_extreme = lapply(seq_along(d), function(i) d[[i]][, lagg_extreme := (sum(extreme)/count(unique(d[[i]][,2]))), by = year])
+
+d_all = lapply(seq_along(d), function(i) d[[i]][, nbr := unlist(nbr[[i]][,1])[1]])
+
+d1 = rbindlist(d_all)
+d1 = d1[,c("year","nbr","lagg_rain","lagg_spi","lagg_extreme")]
+setnames(d1, old="nbr", new="district")
+d1 = unique(d1)
+```
+
+Calculate the district's own lagg rain and spi.
+```{r}
+d1 = lapply(seq_along(ele), function(i) d1[year%in%ele[[i]]])
+d_self_rain = lapply(seq_along(d1), function(i) d1[[i]][, lagg_self_rain := lapply(seq_along(seq(nrow(d1[[i]]))), function(x) b[which(b$year==d1[[i]][x,year]&b$district==d1[[i]][x,district]), rain])])
+d_self_spi = lapply(seq_along(d1), function(i) d1[[i]][, lagg_self_spi := lapply(seq_along(seq(nrow(d1[[i]]))), function(x) b[which(b$year==d1[[i]][x,year]&b$district==d1[[i]][x,district]), spi])])
+d_self_extreme = lapply(seq_along(d1), function(i) d1[[i]][, lagg_self_extreme := lapply(seq_along(seq(nrow(d1[[i]]))), function(x) b[which(b$year==d1[[i]][x,year]&b$district==d1[[i]][x,district]), extreme])])
+```
+Then I change the year in the table to the element next it in the election year list. So all the value calcualte based on the data in current election year are assigned to the next election year, and the value became lagged value.
+```{r}
+#Change the year list so the spi and rain of current election year will be assigned to the previous  election year
+ele1 = sort(append(ele, 1945))
+ele1 = ele1[-length(ele1)]
+d1 = lapply(seq_along(ele), function(i) d1[[i]][,year := ele1[[i]]])
+d1 = d1[-1]
+d1 = rbindlist(d1)
+d1 = d1[lagg_self_rain != 0]
+```
+
+Question 1a
+From the graphs we could observe more new parties appeared when rainfall level is close to 0 or extremely high, which means the the number of new parties might have a positive relationship with extreme weathers. The second graph showed the number of new parties in gernal has a negative relationship with the spi.
+```{r}
+#Plot mean/sum and the new parties
+cor_rain = ggplot(b, aes(rain, new_parties)) + geom_smooth(method = "loess", se = F) + labs(x = "Rainfall", y = "New Patries")
+cor_spi = ggplot(b, aes(spi, new_parties)) + geom_smooth(method = "loess", se = F) + labs(x = "spi", y = "New Parties")
+plot(cor_rain)
+plot(cor_spi)
+```
+Question 1b
+We built two regression models for the rain level and spi. To decide if the target varible is related to the varibles, we will observe if the P value is below a certian value(* mark). The result from the first model shows that the rain level of a district is not dependent from the lagged rain level in this district and its neighbor districts. But the spi is only related to its only lagged value, and it is independent from its neighbors' spi.
+```{r}
+#Question 1b
+lagg = merge(b,d1, by=c('year','district'))
+lagg$lagg_self_rain = unlist(lagg$lagg_self_rain)
+lagg$lagg_self_spi = unlist(lagg$lagg_self_spi)
+lagg$lagg_self_extreme = unlist(lagg$lagg_self_extreme)
+
+# Check relations
+summary(plm(rain ~ lagg_rain + lagg_self_rain, data = lagg, effect = "twoways", model = "within", index = "district"))
+summary(plm(spi ~ lagg_spi + lagg_self_spi, data = lagg, effect = "twoways", model = "within", index = "district"))
+```
+
+Question 1c
+The result shows the years of extreme weather in a district is independent from its lagged value and its neighbors' lagged value.
+```{r}
+summary(pglm(extreme ~ lagg_extreme + lagg_self_extreme, data = lagg, effect = "twoways", model = "within", index = "district", family = "poisson"))
+```
+
+Question 2
+The number of new parties has a positive relationship with the years of extreme weathers, but the relationship is not strong and significant. 
+
+By comparing the results for caste party and socialist party, we can see socialist party is more likely to appear when extreme weather happen in the election period.
+
+```{r}
+summary(pglm(new_parties ~ extreme + length, data = lagg, effect = "individual", model = "within", index = "district", family = "poisson"))
+#which is more likely
+
+summary(pglm(new_parties_caste ~ extreme + length, data = lagg, effect = "individual", model = "within", index = "district", family = "poisson"))
+
+summary(pglm(new_parties_socialist ~ extreme + length, data = lagg, effect = "individual", model = "within", index = "district", family = "poisson"))
+
+```
+Question 3
+The lagged extreme weather years in neighbor districts has a positive relationship with the number of new parties in a district. So the political activity stimulated by extreme weathers in one district does affect political activity in another district.
+```{r}
+ele2 = sort(append(ele, 1945))
+ele2 = sort(append(ele2, 1944))
+ele2 = ele2[-length(ele2)]
+ele2 = ele2[-length(ele2)]
+d2 = lapply(seq_along(ele), function(i) d1[year%in%ele[[i]]])
+d2 = lapply(seq_along(ele), function(i) d2[[i]][,year := ele2[[i]]])
+d2 = d2[-1]
+d2 = d2[-1]
+d2 = rbindlist(d2)
+d2 = d2[lagg_self_rain != 0]
+lagg1 = merge(b,d2, by=c('year','district'))
+lagg1$lagg_self_rain = unlist(lagg1$lagg_self_rain)
+lagg1$lagg_self_spi = unlist(lagg1$lagg_self_spi)
+lagg1$lagg_self_extreme = unlist(lagg1$lagg_self_extreme)
+
+summary(pglm(new_parties ~ extreme + lagg_extreme + length, data = lagg1, effect = "individual", model = "within", index = "district", family = "poisson"))
+
+```
+
+Question 4a
+By comparing the result for nation, state, and regional political party diffusion trend, we can see when extreme weathers happen, it will benefit the diffusion of national political parties, while the state and regional political parties appeared to be less welcome. 
+
+```{r}
+summary(pglm(new_parties_national_scope ~ extreme + lagg_extreme + length, data = lagg1, effect = "individual", model = "within", index = "district", family = "poisson"))
+summary(pglm(new_parties_state_scope ~ extreme + lagg_extreme + length, data = lagg1, effect = "individual", model = "within", index = "district", family = "poisson"))
+summary(pglm(new_parties_regional_scope ~ extreme + lagg_extreme + length, data = lagg1, effect = "individual", model = "within", index = "district", family = "poisson"))
+
+```
+
+Question 4b
+Experiencing droughts or floods relate to political concentration in the past is positively relate to the political concentreation, which means it will contribute to the political concentration. 
+```{r}
+summary(pglm(political_concentration ~ extreme + lagg_extreme + length, data = lagg1, effect = "individual", model = "within", index = "district", family = "poisson"))
+```
+
+
+Question 5
+To check if a party appeared in a distict's neighbors' past election period, I created a list with party dataset segmented by district and then further segmented by election year. Then I fit the neighbors of the district to the lower level tables by condition year of neighbor < election year, so, in each table, the neighbor in previous election years are accumulated. 
+
+Then I create another list to compare the current district new parties with the past neighbor parties and sum the total number of parties appeared in the neighbors' past election.
+```{r}
+pty = pty[,c(1,3,5)]
+pty = unique(pty)
+pty_by_dist = lapply(seq_along(nbr), function(i) pty[district%in%focal[i]])
+pty_by_nbr = lapply(seq_along(nbr), function(i) pty[district%in%unlist(nbr[[i]][,2])])
+pty_by_dist1 = pty_by_dist
+
+mmp = lapply(seq_along(pty_by_dist), function(i) split(pty_by_dist[[i]], f = pty_by_dist[[i]]$year))
+mmp1 = lapply(seq_along(mmp), function(i) mmp[[i]] = lapply(seq_along(pty_by_dist[[i]][,year]), function(x) pty_by_nbr[[i]][year < sort(unique(pty_by_dist[[i]][,year]))[x]]))
+nnq = lapply(seq_along(pty_by_dist), function(i) split(pty_by_dist[[i]], f = pty_by_dist[[i]]$year))
+nnq1 = lapply(seq_along(nnq), function(i) nnq[[i]] = lapply(seq_along(nnq[[i]]),
+                                                            function(x) nnq[[i]][[x]][, diffused := party_name %in% mmp1[[i]][[x]]$party_name]))
+
+nnq1 = rbindlist(lapply(seq_along(nnq1), function(i) rbindlist(nnq1[[i]])))
+
+nnq1_yr = unique(nnq1$year)
+
+nnq1 = lapply(seq_along(nnq1_yr), function(i) nnq1[year%in%nnq1_yr[[i]]])
+nnq1 = lapply(seq_along(nnq1), function(i) nnq1[[i]][, diffuse := sum(diffused), by = district])
+nnq1 = rbindlist(nnq1)
+nnq1 = nnq1[,c(1,2,5)]
+nnq1 = unique(nnq1)
+
+lagg2 = merge(lagg1, nnq1, by=c("year","district"))
+lagg2[, non_diffused := new_parties - diffuse]
+```
+
+The results of the diffused and non_diffused models show that when extreme weather happen in the past election period, the parties from the neighbor region is less likely to diffuse to the neighboring district, while the local new parties are more likly to appear and win the election.
+
+```{r}
+summary(pglm(diffuse ~ extreme + lagg_extreme + length, data = lagg2, effect = "individual", model = "within", index = "district", family = "poisson"))
+summary(pglm(non_diffused ~ extreme + lagg_extreme + length, data = lagg2, effect = "individual", model = "within", index = "district", family = "poisson"))
+
+```
